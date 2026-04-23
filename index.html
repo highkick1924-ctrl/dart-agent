@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DART 공시 AI 에이전트</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0e1a; color: #e2e8f0; font-family: 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1e2d4a; border-radius: 2px; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes bounce {
+      0%,80%,100% { transform: translateY(0); }
+      40%          { transform: translateY(-6px); }
+    }
+    @keyframes pulse {
+      0%,100% { opacity: 1; }
+      50%      { opacity: 0.35; }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .msg-bubble { animation: fadeIn 0.2s ease; }
+    .dot { width:7px; height:7px; border-radius:50%; background:#3b82f6; display:inline-block; }
+    .dot:nth-child(1){ animation: bounce 1s 0.00s infinite; }
+    .dot:nth-child(2){ animation: bounce 1s 0.15s infinite; }
+    .dot:nth-child(3){ animation: bounce 1s 0.30s infinite; }
+    .thinking { animation: pulse 1.2s infinite; }
+
+    .send-btn { transition: background 0.15s, transform 0.1s; }
+    .send-btn:not(:disabled):hover { filter: brightness(1.15); transform: scale(1.03); }
+    .send-btn:not(:disabled):active { transform: scale(0.97); }
+
+    .quick-btn { transition: border-color 0.15s, color 0.15s, background 0.15s; }
+    .quick-btn:hover { border-color: #3b82f6 !important; color: #93c5fd !important; background: #0f1729 !important; }
+
+    .row-link:hover td { background: #141f35 !important; }
+
+    input:focus { border-color: #3b82f6 !important; }
+
+    .settings-panel {
+      background: #0f1729;
+      border-bottom: 1px solid #1e2d4a;
+      overflow: hidden;
+      transition: max-height 0.3s ease, padding 0.3s ease;
+    }
+    .tag { font-size:10px; padding:2px 7px; border-radius:4px; font-weight:600; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+// ── 유틸 ──────────────────────────────────────────────────────────
+const PROXY = "https://corsproxy.io/?";
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`;
+}
+function daysAgo(n) {
+  const d = new Date(); d.setDate(d.getDate()-n);
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`;
+}
+function pad(n){ return String(n).padStart(2,'0'); }
+function fmtDate(s){
+  if(!s||s.length!==8) return s||'';
+  return `${s.slice(0,4)}.${s.slice(4,6)}.${s.slice(6,8)}`;
+}
+
+// ── DART API ──────────────────────────────────────────────────────
+async function dartFetch(endpoint, params) {
+  const qs = new URLSearchParams(params).toString();
+  const target = `https://opendart.fss.or.kr${endpoint}?${qs}`;
+  const res = await fetch(PROXY + encodeURIComponent(target));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const wrapper = await res.json();
+  return wrapper.contents ? JSON.parse(wrapper.contents) : wrapper;
+}
+
+// ── Claude API ────────────────────────────────────────────────────
+async function callClaude(apiKey, messages, system, maxTokens=1000) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:maxTokens, system, messages })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content[0].text;
+}
+
+// ── 프롬프트 ──────────────────────────────────────────────────────
+const PLAN_SYSTEM = `당신은 DART(금융감독원 전자공시시스템) 전문 AI 에이전트입니다.
+사용자 자연어 질문을 분석해 DART API 검색 파라미터를 결정합니다.
+
+DART /api/list.json 파라미터:
+- bgn_de / end_de : 기간 YYYYMMDD
+- corp_name : 공시 대상 회사명
+- flr_name  : 제출인명 (예: 국민연금공단)
+- pblntf_detail_ty 코드:
+    C001/C002 = 주식대량보유, A001 = 사업보고서, A002 = 반기,
+    A003 = 분기, B001 = 주요사항보고서, F001 = 감사보고서
+- page_count: 최대 100
+
+아래 JSON만 출력하세요 (다른 텍스트 금지):
+{
+  "intent": "한 줄 요약",
+  "searches": [
+    {
+      "label": "검색명",
+      "params": { "bgn_de":"...", "end_de":"...", "flr_name":"...", "pblntf_detail_ty":"...", "page_count":"40" }
+    }
+  ]
+}`;
+
+const SUMMARY_SYSTEM = `당신은 DART 전자공시 데이터 분석 전문가입니다.
+검색 결과를 사용자가 이해하기 쉽게 한국어로 간결하게 정리합니다.
+핵심 내용 먼저 요약하고, 중요 종목/기관은 **볼드** 처리하세요.
+결과가 없으면 그 이유를 설명하세요.`;
+
+// ── 마크다운 렌더러 ───────────────────────────────────────────────
+function MD({ text }) {
+  if (!text) return null;
+  return (
+    <div>
+      {text.split('\n').map((line, i) => {
+        if (line.startsWith('## ')) return <div key={i} style={{fontSize:'14px',fontWeight:700,color:'#93c5fd',margin:'8px 0 3px'}}>{line.slice(3)}</div>;
+        if (line.startsWith('# '))  return <div key={i} style={{fontSize:'15px',fontWeight:700,color:'#f1f5f9',margin:'6px 0 2px'}}>{line.slice(2)}</div>;
+        if (line === '---') return <hr key={i} style={{border:'none',borderTop:'1px solid #1e2d4a',margin:'8px 0'}} />;
+        if (line === '') return <br key={i} />;
+
+        const isBullet = line.startsWith('• ') || line.startsWith('- ') || line.startsWith('* ');
+        const content = isBullet ? line.slice(2) : line;
+        const parts = content.split(/(\*\*[^*]+\*\*)/).map((p,j) =>
+          p.startsWith('**') && p.endsWith('**')
+            ? <strong key={j} style={{color:'#f1f5f9'}}>{p.slice(2,-2)}</strong>
+            : p
+        );
+        if (isBullet) return <div key={i} style={{paddingLeft:'14px',marginBottom:'3px'}}><span style={{color:'#3b82f6',marginRight:'6px'}}>•</span>{parts}</div>;
+        return <div key={i} style={{marginBottom:'2px'}}>{parts}</div>;
+      })}
+    </div>
+  );
+}
+
+// ── 메인 앱 ───────────────────────────────────────────────────────
+function App() {
+  const [dartKey, setDartKey]         = useState('');
+  const [claudeKey, setClaudeKey]     = useState('');
+  const [keysSet, setKeysSet]         = useState(false);
+  const [showSettings, setShowSettings] = useState(true);
+  const [messages, setMessages]       = useState([{
+    role:'assistant', type:'welcome',
+    content:'안녕하세요! DART 전자공시 AI 에이전트입니다 📊\n\n자연어로 명령하면 DART를 검색해 정리해드립니다.\n\n예시:\n• **오늘 국민연금 공시 찾아줘**\n• **이번 달 5% 지분 매매 공시 정리해줘**\n• **삼성전자 최근 공시 목록**\n• **이번 주 주요사항보고서 전체**\n• **KB금융 대량보유 공시 찾아줘**'
+  }]);
+  const [input, setInput]   = useState('');
+  const [loading, setLoading] = useState(false);
+  const bottomRef = useRef(null);
+  const inputRef  = useRef(null);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages, loading]);
+
+  const addMsg = (msg) => setMessages(prev => [...prev, msg]);
+  const removeType = (type) => setMessages(prev => prev.filter(m => m.type !== type));
+
+  const handleSetKeys = () => {
+    if (!dartKey.trim() || !claudeKey.trim()) return;
+    setKeysSet(true);
+    setShowSettings(false);
+  };
+
+  const QUICK = [
+    '오늘 국민연금 공시 찾아줘',
+    '이번 달 5% 지분 매매 공시',
+    '최근 7일 대량보유 공시 전체',
+    '이번 주 주요사항보고서',
+    '삼성전자 최근 공시',
+  ];
+
+  const handleSend = async () => {
+    if (!input.trim() || loading || !keysSet) return;
+    const q = input.trim();
+    setInput('');
+    addMsg({ role:'user', content:q });
+    setLoading(true);
+
+    try {
+      // 1. 의도 분석
+      addMsg({ role:'assistant', type:'thinking', content:'🔍 질문 분석 중...' });
+      const today = todayStr();
+      const planRaw = await callClaude(claudeKey,
+        [{ role:'user', content:`오늘: ${fmtDate(today)}\n\n질문: ${q}` }],
+        PLAN_SYSTEM
+      );
+      let plan;
+      try {
+        const m = planRaw.match(/\{[\s\S]*\}/);
+        plan = JSON.parse(m ? m[0] : planRaw);
+      } catch {
+        throw new Error('검색 계획 분석 실패: ' + planRaw.slice(0,80));
+      }
+      removeType('thinking');
+
+      // 2. DART 검색
+      addMsg({ role:'assistant', type:'searching',
+        content:`🎯 **${plan.intent}**\n\n` + plan.searches.map(s=>`📡 ${s.label} 검색 중...`).join('\n')
+      });
+
+      const results = [];
+      for (const s of plan.searches) {
+        try {
+          const body = await dartFetch('/api/list.json', { crtfc_key:dartKey, sort:'date', sort_mth:'desc', ...s.params });
+          if (body.status==='000' && body.list?.length > 0) {
+            results.push({ label:s.label, items:body.list, total:body.total_count });
+          } else {
+            results.push({ label:s.label, items:[], total:0, note: body.message||'결과 없음' });
+          }
+        } catch(e) {
+          results.push({ label:s.label, items:[], total:0, note:`오류: ${e.message}` });
+        }
+      }
+      removeType('searching');
+
+      // 3. 요약
+      const raw = results.map(r =>
+        `[${r.label}] 총 ${r.total||0}건${r.note?' ('+r.note+')':''}\n` +
+        (r.items.slice(0,30).map(i=>`- ${fmtDate(i.rcept_dt)} | ${i.corp_nm} | ${i.report_nm} | 제출: ${i.flr_nm}`).join('\n')||'(없음)')
+      ).join('\n\n');
+
+      const summary = await callClaude(claudeKey,
+        [{ role:'user', content:`질문: "${q}"\n\nDART 결과:\n${raw}\n\n정리해주세요.` }],
+        SUMMARY_SYSTEM, 800
+      );
+
+      addMsg({ role:'assistant', type:'result', content:summary, rawData:results });
+
+    } catch(e) {
+      removeType('thinking'); removeType('searching');
+      addMsg({ role:'assistant', type:'error', content:`❌ 오류: ${e.message}` });
+    } finally {
+      setLoading(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  return (
+    <div style={{height:'100vh',display:'flex',flexDirection:'column',background:'#0a0e1a'}}>
+
+      {/* ── 헤더 ── */}
+      <div style={{background:'linear-gradient(90deg,#0f1729,#0a0e1a)',borderBottom:'1px solid #1e2d4a',padding:'13px 20px',display:'flex',alignItems:'center',justifyContent:'space-between',flexShrink:0}}>
+        <div style={{display:'flex',alignItems:'center',gap:'10px'}}>
+          <div style={{width:'34px',height:'34px',borderRadius:'9px',background:'linear-gradient(135deg,#3b82f6,#06b6d4)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'17px',boxShadow:'0 0 14px #3b82f640'}}>
+            📊
+          </div>
+          <div>
+            <div style={{fontSize:'15px',fontWeight:700,letterSpacing:'-0.3px',color:'#f1f5f9'}}>DART 공시 AI 에이전트</div>
+            <div style={{fontSize:'11px',color:'#475569'}}>전자공시 실시간 검색 · AI 정리 시스템</div>
+          </div>
+        </div>
+        <button onClick={()=>setShowSettings(s=>!s)} style={{background:keysSet?'#1e3a5f':'#450a0a',border:`1px solid ${keysSet?'#3b82f6':'#dc2626'}`,color:keysSet?'#93c5fd':'#fca5a5',borderRadius:'7px',padding:'6px 14px',fontSize:'12px',cursor:'pointer',fontWeight:600}}>
+          {keysSet ? '✓ API 연결됨' : '⚙ API 키 설정'}
+        </button>
+      </div>
+
+      {/* ── 설정 패널 ── */}
+      <div className="settings-panel" style={{maxHeight:showSettings?'200px':'0',padding:showSettings?'16px 20px':'0 20px'}}>
+        <div style={{fontSize:'11px',color:'#475569',marginBottom:'10px',fontWeight:700,letterSpacing:'1px',textTransform:'uppercase'}}>API 키 설정</div>
+        <div style={{display:'flex',gap:'10px',flexWrap:'wrap',alignItems:'flex-end'}}>
+          <div style={{flex:'1 1 180px'}}>
+            <div style={{fontSize:'11px',color:'#64748b',marginBottom:'4px'}}>
+              DART OpenAPI 키&nbsp;
+              <a href="https://opendart.fss.or.kr" target="_blank" style={{color:'#3b82f6',textDecoration:'none'}}>↗ 발급</a>
+            </div>
+            <input type="password" placeholder="DART 인증키..." value={dartKey} onChange={e=>setDartKey(e.target.value)}
+              style={{width:'100%',background:'#0a0e1a',border:'1px solid #1e2d4a',borderRadius:'7px',padding:'8px 11px',fontSize:'12px',color:'#e2e8f0',outline:'none'}} />
+          </div>
+          <div style={{flex:'1 1 180px'}}>
+            <div style={{fontSize:'11px',color:'#64748b',marginBottom:'4px'}}>
+              Anthropic API 키&nbsp;
+              <a href="https://console.anthropic.com" target="_blank" style={{color:'#3b82f6',textDecoration:'none'}}>↗ 발급</a>
+            </div>
+            <input type="password" placeholder="sk-ant-..." value={claudeKey} onChange={e=>setClaudeKey(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&handleSetKeys()}
+              style={{width:'100%',background:'#0a0e1a',border:'1px solid #1e2d4a',borderRadius:'7px',padding:'8px 11px',fontSize:'12px',color:'#e2e8f0',outline:'none'}} />
+          </div>
+          <button onClick={handleSetKeys} disabled={!dartKey.trim()||!claudeKey.trim()}
+            style={{background:dartKey&&claudeKey?'linear-gradient(135deg,#3b82f6,#06b6d4)':'#1e2d4a',color:dartKey&&claudeKey?'#fff':'#475569',border:'none',borderRadius:'7px',padding:'8px 20px',fontSize:'13px',fontWeight:700,cursor:dartKey&&claudeKey?'pointer':'not-allowed',whiteSpace:'nowrap'}}>
+            연결하기
+          </button>
+        </div>
+        <div style={{marginTop:'10px',fontSize:'11px',color:'#334155',lineHeight:1.6}}>
+          ⚠ API 키는 이 브라우저에만 저장되며 서버로 전송되지 않습니다.
+        </div>
+      </div>
+
+      {/* ── 메시지 영역 ── */}
+      <div style={{flex:1,overflowY:'auto',padding:'18px 20px',display:'flex',flexDirection:'column',gap:'14px'}}>
+        {messages.map((msg, i) => (
+          <div key={i} className="msg-bubble" style={{display:'flex',justifyContent:msg.role==='user'?'flex-end':'flex-start',gap:'8px',alignItems:'flex-start'}}>
+
+            {msg.role==='assistant' && (
+              <div style={{width:'28px',height:'28px',borderRadius:'7px',background:'linear-gradient(135deg,#3b82f6,#06b6d4)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'13px',flexShrink:0,marginTop:'2px'}}>
+                🤖
+              </div>
+            )}
+
+            <div style={{
+              maxWidth:'82%',
+              background: msg.role==='user' ? 'linear-gradient(135deg,#1d4ed8,#0369a1)'
+                        : msg.type==='error'    ? '#2d0f0f'
+                        : msg.type==='thinking' || msg.type==='searching' ? '#111827'
+                        : '#0f1729',
+              border:'1px solid',
+              borderColor: msg.role==='user'   ? '#2563eb'
+                         : msg.type==='error'  ? '#dc2626'
+                         : '#1e2d4a',
+              borderRadius: msg.role==='user'  ? '16px 4px 16px 16px' : '4px 16px 16px 16px',
+              padding:'11px 15px', fontSize:'13px', lineHeight:'1.7', color:'#e2e8f0',
+              whiteSpace:'pre-wrap'
+            }}>
+              {(msg.type==='thinking'||msg.type==='searching')
+                ? <span className="thinking">{msg.content}</span>
+                : <MD text={msg.content} />
+              }
+
+              {/* 원문 테이블 */}
+              {msg.rawData && msg.rawData.some(r=>r.items.length>0) && (
+                <div style={{marginTop:'14px',borderTop:'1px solid #1e2d4a',paddingTop:'12px'}}>
+                  {msg.rawData.map((r,ri) => r.items.length>0 && (
+                    <div key={ri} style={{marginBottom:'14px'}}>
+                      <div style={{fontSize:'11px',color:'#64748b',marginBottom:'7px',fontWeight:700}}>
+                        📋 {r.label} — {r.items.length}건 표시 {r.total>r.items.length?`(전체 ${r.total}건)`:''}
+                      </div>
+                      <div style={{overflowX:'auto',borderRadius:'6px',border:'1px solid #1e2d4a'}}>
+                        <table style={{width:'100%',borderCollapse:'collapse',fontSize:'11px'}}>
+                          <thead>
+                            <tr style={{background:'#141f35'}}>
+                              {['접수일','회사명','보고서명','제출인'].map(h=>(
+                                <th key={h} style={{padding:'6px 10px',textAlign:'left',color:'#475569',fontWeight:700,borderBottom:'1px solid #1e2d4a',whiteSpace:'nowrap',letterSpacing:'0.3px'}}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {r.items.slice(0,30).map((item,ii)=>(
+                              <tr key={ii} className="row-link"
+                                style={{borderBottom:'1px solid #1a2640',cursor:'pointer'}}
+                                onClick={()=>window.open(`https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${item.rcept_no}`,'_blank')}>
+                                <td style={{padding:'6px 10px',color:'#64748b',whiteSpace:'nowrap'}}>{fmtDate(item.rcept_dt)}</td>
+                                <td style={{padding:'6px 10px',fontWeight:700,color:'#93c5fd',whiteSpace:'nowrap'}}>{item.corp_nm}</td>
+                                <td style={{padding:'6px 10px',color:'#cbd5e1',maxWidth:'220px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{item.report_nm}</td>
+                                <td style={{padding:'6px 10px',color:'#64748b',whiteSpace:'nowrap'}}>{item.flr_nm}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      {r.items.length>30 && <div style={{fontSize:'11px',color:'#475569',marginTop:'4px',textAlign:'right'}}>... 외 {r.items.length-30}건 더 있음</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {msg.role==='user' && (
+              <div style={{width:'28px',height:'28px',borderRadius:'7px',background:'#1e3a5f',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'13px',flexShrink:0,marginTop:'2px'}}>
+                👤
+              </div>
+            )}
+          </div>
+        ))}
+
+        {loading && (
+          <div style={{paddingLeft:'36px',display:'flex',gap:'5px',alignItems:'center'}}>
+            <span className="dot"/><span className="dot"/><span className="dot"/>
+          </div>
+        )}
+        <div ref={bottomRef}/>
+      </div>
+
+      {/* ── 빠른 명령 ── */}
+      <div style={{padding:'8px 20px 4px',display:'flex',gap:'6px',overflowX:'auto',flexShrink:0,borderTop:'1px solid #1e2d4a'}}>
+        {QUICK.map((q,i)=>(
+          <button key={i} className="quick-btn"
+            onClick={()=>{setInput(q);inputRef.current?.focus();}}
+            style={{background:'transparent',border:'1px solid #1e2d4a',borderRadius:'20px',padding:'4px 13px',fontSize:'11px',color:'#64748b',cursor:'pointer',whiteSpace:'nowrap',flexShrink:0}}>
+            {q}
+          </button>
+        ))}
+      </div>
+
+      {/* ── 입력창 ── */}
+      <div style={{padding:'10px 20px 18px',display:'flex',gap:'8px',flexShrink:0}}>
+        <input ref={inputRef} value={input}
+          onChange={e=>setInput(e.target.value)}
+          onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&handleSend()}
+          placeholder={keysSet?'공시를 자유롭게 검색하세요... (Enter 전송)':'먼저 API 키를 설정해주세요 ↑'}
+          disabled={loading||!keysSet}
+          style={{flex:1,background:'#0f1729',border:'1px solid #1e2d4a',borderRadius:'10px',padding:'11px 15px',fontSize:'13px',color:'#e2e8f0',outline:'none',transition:'border-color 0.15s'}} />
+        <button className="send-btn" onClick={handleSend}
+          disabled={loading||!input.trim()||!keysSet}
+          style={{background:!loading&&input.trim()&&keysSet?'linear-gradient(135deg,#3b82f6,#06b6d4)':'#1e2d4a',color:!loading&&input.trim()&&keysSet?'#fff':'#475569',border:'none',borderRadius:'10px',padding:'11px 20px',fontSize:'13px',fontWeight:700,cursor:!loading&&input.trim()&&keysSet?'pointer':'not-allowed',whiteSpace:'nowrap'}}>
+          {loading?'⏳':'전송 ↑'}
+        </button>
+      </div>
+
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
